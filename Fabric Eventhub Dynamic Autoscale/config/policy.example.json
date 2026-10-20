@@ -1,0 +1,42 @@
+
+{
+  "azure": {
+    "subscription_id": "",
+    "resource_group": "",
+    "capacity_name": ""
+  },
+  "eventhub": {
+    "namespace": "",
+    "name": "",
+    "consumer_group": "$Default",
+    "receive_seconds": 30
+  },
+  "schedule": {
+    "timezone": "Asia/Seoul",
+    "weekdays": [0, 1, 2, 3, 4],
+    "start": "08:15",
+    "end": "17:45"
+  },
+  "rule": {
+    "window_minutes": 10,
+    "step_minutes": 1,
+    "required_steps": 5,
+    "scale_up_threshold": 80,
+    "scale_down_threshold": 40,
+    "min_coverage": 0.95,
+    "max_gap_seconds": 60,
+    "min_events_per_window": 20
+  },
+  "sku_policy": {
+    "ladder": ["F2", "F4", "F8", "F16", "F32", "F64"],
+    "minimum": "F8",
+    "maximum": "F32"
+  },
+  "verify": {
+    "timeout_seconds": 300,
+    "interval_seconds": 15
+  },
+  "notifications": {
+    "webhook_url_env": "TEAMS_WEBHOOK_URL"
+  }
+}

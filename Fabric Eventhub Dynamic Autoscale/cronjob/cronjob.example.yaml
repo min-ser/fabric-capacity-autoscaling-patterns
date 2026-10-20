@@ -1,0 +1,41 @@
+# Example only. Replace image, namespace, serviceAccountName and config/secret references.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: fabric-dynamic-autoscale
+  namespace: REPLACE_NAMESPACE
+spec:
+  schedule: "*/15 * * * *"
+  timeZone: "Asia/Seoul"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            azure.workload.identity/use: "true"
+        spec:
+          serviceAccountName: REPLACE_WORKLOAD_IDENTITY_SERVICE_ACCOUNT
+          restartPolicy: Never
+          containers:
+            - name: autoscaler
+              image: REPLACE_IMAGE_WITH_PYTHON_DEPENDENCIES
+              command: ["python", "/app/ref_fab_cu_dynamic_autoscale.py"]
+              env:
+                - name: ENV
+                  value: "stg"
+                - name: subscriptionId
+                  value: "REPLACE_SUBSCRIPTION_ID"
+                - name: resourceGroup
+                  value: "REPLACE_RESOURCE_GROUP"
+                - name: capacityName
+                  value: "REPLACE_CAPACITY_NAME"
+                - name: Fabric-Event-Hub-namespace-endpoint
+                  value: "REPLACE_NAMESPACE.servicebus.windows.net"
+                - name: Fabric-Event-Hub-name
+                  value: "REPLACE_EVENTHUB_NAME"
+                - name: Fabric-Event-Hub-Consumer-group
+                  value: "REPLACE_CONSUMER_GROUP"
+                # Supply TEAMS_WEBHOOK_URL securely using secretKeyRef when required.
