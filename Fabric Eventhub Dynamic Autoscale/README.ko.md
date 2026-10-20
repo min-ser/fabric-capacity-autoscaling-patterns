@@ -1,636 +1,345 @@
-# Microsoft Fabric Capacity Autoscaling Patterns
+# Microsoft Fabric Capacity Dynamic Autoscale
 
-**한국어** | [English](README.ko.md)
+Azure Event Hubs에서 Microsoft Fabric Capacity 사용률 데이터를 수집하고, AKS CronJob에서 Rolling Average(이동평균)를 계산하여 Fabric Capacity SKU를 자동으로 조정하는 구현 패턴입니다.
 
-본 Repository는 **Microsoft Fabric Capacity의 사용량을 기반으로 Fabric SKU를 자동 조정하는 Autoscaling 아키텍처 및 POC 구현 패턴**을 정리한 프로젝트입니다.
+> **공개용 예제:** 아래 환경명, SKU 범위, 운영시간은 구현 사례를 바탕으로 한 예시 설정값입니다. 실제 환경에 맞게 변경해야 합니다. 이 문서에는 내부 GitLab URL, 실제 Capacity 이름 및 인증정보를 포함하지 않습니다.
 
-Microsoft Fabric Real-Time Intelligence에서 제공하는 Capacity Event를 기반으로 다음 세 가지 방식을 구성하고 비교합니다.
+## 1. 개요
 
-1. **Pattern 1 — Eventstream + Activator + Notebook**
-2. **Pattern 2 — Eventstream Custom Endpoint + AKS CronJob**
-3. **Pattern 3 — Event Hubs + AKS Dynamic Autoscale**
+Microsoft Fabric Capacity에 필요한 컴퓨팅 리소스는 업무시간과 워크로드 부하에 따라 달라집니다. Dynamic Autoscale은 Capacity 사용률을 주기적으로 평가하여 높은 사용률이 지속되면 Scale Up하고, 낮은 사용률이 지속되면 Scale Down합니다.
 
-세 가지 방식 모두 Fabric Capacity Event를 사용량 지표로 활용하지만, **사용률을 분석하고 Autoscaling 조건을 판단하는 위치와 실행 방식이 다릅니다.**
-
----
-
-## 1. Overview
-
-Microsoft Fabric Capacity에서는 Capacity 사용량과 상태 정보를 Event 형태로 제공할 수 있습니다.
-
-본 프로젝트에서는 다음 Event Type을 주요 Autoscaling Metric Source로 사용합니다.
-
-```text
-Microsoft.Fabric.Capacity.Summary
-```
-
-Capacity Summary Event에는 다음과 같은 정보가 포함될 수 있습니다.
-
-```text
-capacityName
-capacitySku
-capacityRegion
-baseCapacityUnits
-capacityUnitMs
-windowStartTime
-windowEndTime
-utilizationBackground
-utilizationInteractive
-interactiveDelayThresholdPercentage
-interactiveRejectionThresholdPercentage
-backgroundRejectionThresholdPercentage
-overageTotalCapacityUnitMs
-```
-
-해당 데이터를 활용하여 Fabric Capacity Utilization을 계산하고, 환경별 정책에 따라 Scale Up / Scale Down 여부를 결정합니다.
-
-### Autoscaling Patterns
-
-| 구분 | Pattern 1 | Pattern 2 | Pattern 3 |
-|---|---|---|---|
-| 아키텍처 | Activator + Notebook | Custom Endpoint + AKS | Event Hubs + AKS Dynamic Autoscale |
-| 사용률 계산 | Fabric Eventstream | Python | Python |
-| Scaling 판단 | Fabric Activator | Python | Python Rolling Average |
-| 실행 방식 | Event-driven | Scheduled One-Shot | Scheduled One-Shot |
-| Control Plane | Microsoft Fabric | AKS | AKS |
-| Capacity 변경 | Azure ARM API | Azure ARM API | Azure ARM API |
-| 주요 특징 | Fabric Native | External Control Plane | 운영 정책 기반 Dynamic Scaling |
-
----
-
-## 2. Architecture Patterns
-
-세 가지 패턴은 동일한 Fabric Capacity Summary Event를 기반으로 구성됩니다.
-
-```mermaid
-flowchart TD
-    A["Microsoft Fabric Capacity"]
-    B["Capacity Summary Events"]
-    C["Fabric Eventstream"]
-
-    A --> B --> C
-
-    C --> D["Pattern 1<br/>Fabric Activator"]
-    C --> E["Pattern 2<br/>Custom Endpoint"]
-    C --> F["Pattern 3<br/>Azure Event Hubs"]
-
-    D --> G["Fabric Notebook"]
-    E --> H["AKS CronJob<br/>Python Autoscaler"]
-    F --> I["AKS CronJob<br/>Dynamic Autoscaler"]
-
-    I --> J["14-Minute Lookback<br/>5 Rolling Evaluations"]
-
-    G --> K["Azure Resource Manager"]
-    H --> K
-    J --> K
-
-    K --> L["Fabric Capacity SKU<br/>Scale Up / Down"]
-```
-
-### Architecture Comparison
-
-| 항목 | Pattern 1 | Pattern 2 | Pattern 3 |
-|---|---|---|---|
-| Metric Source | Capacity Summary Event | Capacity Summary Event | Capacity Summary Event |
-| Event Processing | Eventstream | Eventstream | Eventstream |
-| Event Consumer | Activator | AKS Python | AKS Python |
-| Scaling Trigger | Activator Rule | CronJob | CronJob |
-| Utilization Evaluation | Activator Window | Application Logic | 10분 평균 × 5 Step |
-| ARM API 실행 위치 | Notebook | AKS | AKS |
-| Kubernetes 필요 | 아니요 | 예 | 예 |
-| Notebook Session 필요 | 예 | 아니요 | 아니요 |
-| 운영 시간 정책 | Rule 구성에 따름 | 구현 정책에 따름 | 평일 08:15–17:45 KST |
-| Teams 알림 | 구현에 따름 | 구현에 따름 | 지원 |
-
-Pattern 2와 Pattern 3는 모두 AKS 기반이지만, **Pattern 3는 운영 시간, Rolling Average, 연속 임계값, 환경별 SKU 범위 및 Teams 알림을 포함한 구체적인 Dynamic Autoscale 구현**에 초점을 맞춥니다.
-
----
-
-## 3. Pattern 1 — Eventstream + Activator + Notebook
-
-📁 [`Fabric Eventstream Activator Notebook`](./Fabric%20Eventstream%20Activator%20Notebook/)
-
-Microsoft Fabric 내부의 Real-Time Intelligence 기능을 중심으로 Autoscaling을 구성하는 방식입니다.
-
-```mermaid
-flowchart TD
-    A["Fabric Capacity"]
-    B["Capacity Summary Event"]
-    C["Fabric Eventstream"]
-    D["Stream Query<br/>Utilization Calculation"]
-    E["Fabric Activator"]
-    F["Threshold Rule"]
-    G["Fabric Notebook"]
-    H["Azure ARM API"]
-    I["Fabric Capacity SKU"]
-
-    A --> B --> C --> D --> E --> F --> G --> H --> I
-```
-
-Eventstream에서 `Microsoft.Fabric.Capacity.Summary` Event를 처리하고 Utilization을 계산합니다.
-
-Activator에서는 다음과 같은 Window 기반 Rule을 사용할 수 있습니다.
-
-```text
-Window Size  : 10분
-Step Size    : 1분
-Time Elapsed : 5분
-```
-
-Threshold 예시:
-
-```text
-Scale Up   : Utilization > 60%
-Scale Down : Utilization < 30%
-```
-
-조건이 지정된 시간 동안 지속되면 Activator가 Fabric Notebook을 실행합니다.
-
-Notebook은 Activator Parameter를 수신하고, 현재 Capacity 상태 및 SKU를 확인한 후 Azure ARM API를 통해 SKU 변경을 요청합니다.
-
-### 주요 특징
-
-- Fabric Native Architecture 중심의 Autoscaling
-- Event-driven 방식의 Threshold 평가
-- Activator Window / Step / Time Elapsed 활용
-- 별도 Kubernetes Event Consumer 불필요
-- Fabric Notebook을 통한 Azure ARM API 호출
-- Notebook Session 초기화 시간 고려 필요
-
----
-
-## 4. Pattern 2 — Eventstream Custom Endpoint + AKS CronJob
-
-📁 [`Fabric Eventstream Custom Endpoint`](./Fabric%20Eventstream%20Custom%20Endpoint/)
-
-Autoscaling Control Plane을 Microsoft Fabric 외부의 AKS로 분리하는 방식입니다.
-
-Fabric Eventstream은 Capacity Event를 제공하며, AKS CronJob에서 Event Hubs-compatible Custom Endpoint를 통해 Event를 수신하고 Autoscaling 로직을 수행합니다.
-
-```mermaid
-flowchart TD
-    A["Fabric Capacity"]
-    B["Capacity Summary Event"]
-    C["Fabric Eventstream"]
-    D["Custom Endpoint<br/>Event Hubs Compatible"]
-    E["AMQP over WebSocket<br/>TCP 443"]
-    F["AKS CronJob"]
-    G["Python Autoscaler"]
-    H["Utilization Calculation"]
-    I["Autoscaling Decision"]
-    J["Azure ARM API"]
-    K["Fabric Capacity SKU"]
-
-    A --> B --> C --> D --> E --> F --> G --> H --> I --> J --> K
-```
-
-Custom Endpoint 연결에 필요한 주요 정보는 다음과 같습니다.
-
-```text
-Event Hub Namespace Endpoint
-Event Hub Name
-Consumer Group
-```
-
-Azure Event Hubs Python SDK 연결 예시:
-
-```python
-client = EventHubConsumerClient(
-    fully_qualified_namespace=EVENTHUB_NAMESPACE,
-    eventhub_name=EVENTHUB_NAME,
-    consumer_group=CONSUMER_GROUP,
-    credential=DefaultAzureCredential(),
-    transport_type=TransportType.AmqpOverWebsocket,
-)
-```
-
-CronJob은 상시 실행 Consumer가 아닌 **One-Shot Batch 방식**으로 동작합니다.
-
-### 주요 특징
-
-- Autoscaling Control Plane을 Fabric 외부로 분리
-- 기존 AKS CronJob 운영체계 활용
-- Fabric Notebook Session 불필요
-- Microsoft Entra ID / AKS Workload Identity 인증
-- Event Hubs-compatible Custom Endpoint 활용
-- AMQP over WebSocket / TCP 443 통신
-- Python 기반 Autoscaling Policy 구현 가능
-
----
-
-## 5. Pattern 3 — Event Hubs + AKS Dynamic Autoscale
-
-📁 [`Fabric Eventhub Dynamic Autoscale`](./Fabric%20Eventhub%20Dynamic%20Autoscale/)
-
-**Pattern 3는 Fabric Capacity 사용률을 주기적으로 분석하여 운영 정책에 따라 Capacity SKU를 자동으로 변경하는 Dynamic Autoscale 구현입니다.**
-
-Pattern 2와 마찬가지로 AKS에서 실행하지만, 실제 운영을 고려한 시간 제어와 연속 사용률 분석 로직이 추가되어 있습니다.
-
-### Architecture
-
-```mermaid
-flowchart TD
-    A["Microsoft Fabric Capacity"]
-    B["Fabric Eventstream"]
-    C["Azure Event Hubs"]
-    D["AKS CronJob<br/>Every 15 Minutes"]
-    E["Collect Last 14 Minutes"]
-    F["10-Minute Rolling Average"]
-    G["5 Evaluations<br/>1-Minute Steps"]
-    H{"Scaling Condition"}
-
-    A --> B --> C --> D --> E --> F --> G --> H
-
-    H -->|"All > 80%"| I["SCALE_UP"]
-    H -->|"All < 40%"| J["SCALE_DOWN"]
-    H -->|"Otherwise"| K["MAINTAIN / SKIP"]
-
-    I --> L["SKU Policy Validation"]
-    J --> L
-
-    L --> M["Azure ARM API"]
-    M --> N["Fabric Capacity SKU Change Request"]
-    N --> O["Microsoft Teams Notification"]
-```
-
-### 운영 정책
-
-| 항목 | 설정 |
-|---|---|
-| 운영 요일 | 월요일~금요일 |
-| 운영 시간 | 08:15–17:45 KST |
-| CronJob 실행 주기 | 15분 |
-| 주말 | Dynamic Autoscale 미운영 |
-| 데이터 조회 범위 | 최근 14분 |
-| Rolling Window | 10분 |
-| Step Size | 1분 |
-| 연속 평가 횟수 | 5회 |
-| Scale Up | 5개 평균 모두 80% 초과 |
-| Scale Down | 5개 평균 모두 40% 미만 |
-| 조건 미충족 | MAINTAIN |
-| 데이터 부족 | SKIP |
-| STG | F8 ↔ F16 |
-| PRD | F16 ↔ F32 |
-| SKU 변경 단위 | 한 단계씩 |
-| 알림 | Microsoft Teams |
-
-### Rolling Average
-
-예를 들어 15:00 KST에 CronJob이 실행되면 최근 14분 데이터를 이용해 다음과 같이 계산합니다.
-
-| Step | Window Start | Window End |
+| 예시 환경 | Dynamic SKU 범위 | 변경 단위 |
 |---|---|---|
-| 1 | 14:46 | 14:56 |
-| 2 | 14:47 | 14:57 |
-| 3 | 14:48 | 14:58 |
-| 4 | 14:49 | 14:59 |
-| 5 | 14:50 | 15:00 |
+| STG | F8 ↔ F16 | 인접 SKU 한 단계 |
+| PRD | F16 ↔ F32 | 인접 SKU 한 단계 |
 
-5개 Step의 평균 사용률이 모두 80%를 초과하면 Scale Up, 모두 40% 미만이면 Scale Down을 판단합니다.
+예를 들어 PRD 환경의 현재 SKU가 F16이고 Scale Up 조건이 충족되면 F32로 변경을 요청합니다. 실제 정책은 `DYNAMIC_SKU_POLICY`에 정의됩니다.
 
-CronJob 실행 주기는 15분이며, 1분 Step은 **한 번의 CronJob 실행 내부에서 계산하는 Rolling Average 간격**입니다.
-
-### Operating Schedule
+## 2. 전체 아키텍처
 
 ```mermaid
 flowchart LR
-    A["08:00<br/>Scheduled Operation"]
-    B["08:15<br/>Dynamic Starts"]
-    C["Utilization-Based Scaling"]
-    D["17:45<br/>Dynamic Ends"]
-    E["18:00<br/>Scheduled Operation"]
-
-    A --> B --> C --> D --> E
+    A[Microsoft Fabric Capacity] -->|Capacity Summary| B[Fabric Eventstream]
+    B --> C[Azure Event Hubs]
+    C -->|AMQP over WebSocket / TCP 443| D[AKS CronJob]
+    I[AKS Workload Identity] --> D
+    D --> E[최근 14분 이벤트 수집]
+    E --> F[10분 Rolling Average × 5회]
+    F --> G{Scale 판단}
+    G -->|SCALE_UP / SCALE_DOWN| H[Azure Resource Manager API]
+    H --> J[Fabric Capacity SKU 변경 요청]
+    G -->|MAINTAIN / SKIP| K[현재 SKU 유지]
+    H --> L[Microsoft Teams 알림]
 ```
 
-Dynamic Autoscale 운영 시간은 별도로 구성된 Schedule 기반 Capacity 관리 작업과의 충돌 위험을 줄이기 위해 설정되었습니다.
+- **데이터 수집:** Fabric Capacity Summary 이벤트를 Eventstream을 통해 Event Hubs로 전달합니다.
+- **인증:** AKS Workload Identity와 `DefaultAzureCredential`을 사용하며, 코드에 인증정보를 저장하지 않습니다.
+- **제어:** CronJob이 Azure Resource Manager(ARM) API를 통해 Capacity 상태를 조회하고 필요한 경우 SKU 변경을 요청합니다.
+- **검증:** 별도의 POC 스크립트에서 동일한 이벤트를 분석하지만 실제 SKU는 변경하지 않습니다.
 
-### Pattern 3 Documentation
+## 3. 평일 운영 정책
 
-- [Dynamic Autoscale Guide — English](./Fabric%20Eventhub%20Dynamic%20Autoscale/README.md)
-- [Dynamic Autoscale Guide — 한국어](./Fabric%20Eventhub%20Dynamic%20Autoscale/README.ko.md)
+Dynamic Autoscale은 **월요일부터 금요일까지 08:15 이상, 17:45 미만(KST)** 에 동작하도록 설정되어 있습니다.
 
-상세한 사용률 계산, 운영 정책, 배포 구성, Teams 알림 및 검증 방법은 위 문서를 참고하세요.
+기존 Schedule 기반 Capacity 제어 작업과의 충돌 가능성을 줄이기 위해 업무 시작 및 종료 시점에 각각 15분의 간격을 둡니다.
 
----
-
-## 6. Capacity Utilization Calculation
-
-세 가지 패턴 모두 Fabric Capacity Summary Event의 사용량 정보를 기반으로 Utilization을 계산합니다.
-
-### Formula
-
-```text
-Capacity Budget (CUms)
-    = baseCapacityUnits × Window Duration (ms)
-
-Utilization (%)
-    = capacityUnitMs / Capacity Budget × 100
+```mermaid
+flowchart LR
+    A["08:00<br/>Schedule 기반<br/>업무 시작 SKU 설정"] --> B["08:15<br/>Dynamic Autoscale 시작"]
+    B --> C["사용률 기반 SKU 조정<br/>15분 간격"]
+    C --> D["17:45<br/>Dynamic Autoscale 종료"]
+    D --> E["18:00<br/>Schedule 기반<br/>업무 종료 SKU 설정"]
 ```
 
-30초 Window 기준:
+**주의:** 15분의 간격은 충돌 가능성을 줄이지만, 이전 Job의 실행이 지연되어 중복되는 상황까지 완전히 방지하지는 못합니다. 운영환경에서는 CronJob 중복 실행을 방지하고 다른 SKU 제어 작업과 실행시간을 조정해야 합니다.
 
-```text
-Utilization (%)
-    = capacityUnitMs / (baseCapacityUnits × 30,000) × 100
+### 평일 동작 예시
+
+PRD 환경이 F16으로 시작한 경우, 높은 사용률이 연속적으로 유지되는 조건을 충족하면 F32로 Scale Up을 요청합니다.
+
+이후 낮은 사용률이 연속적으로 유지되는 조건을 충족하면 F16으로 Scale Down을 요청합니다.
+
+일시적인 사용률 급증이나 감소만으로는 SKU 변경이 발생하지 않습니다.
+
+## 4. 주말 운영 정책
+
+Dynamic Autoscale은 토요일과 일요일에는 동작하지 않습니다.
+
+주말에 CronJob이 실행되더라도 애플리케이션에서 요일을 확인한 후 정상 종료하며, 사용률 데이터를 수집하거나 분석하지 않고 SKU도 변경하지 않습니다.
+
+주말 Capacity 운영은 별도로 정의된 Schedule 기반 정책을 따릅니다.
+
+## 5. Autoscale 처리 흐름
+
+```mermaid
+flowchart TD
+    A([CronJob 시작]) --> B{평일 및 운영시간 이내인가?}
+    B -->|아니요| Z([정상 종료])
+    B -->|예| C[ARM API로 현재 Capacity 조회]
+    C --> D{Capacity Active 및 지원 SKU인가?}
+    D -->|아니요| Z
+    D -->|예| E[Event Hubs에서 최근 14분 이벤트 수집]
+    E --> F[10분 Rolling Average 5회 계산]
+    F --> G{5개 Step 및 이벤트 수 충분한가?}
+    G -->|아니요| Z
+    G -->|예| H{모든 평균이 80% 초과인가?}
+    H -->|예| I[한 단계 Scale Up 목표 계산]
+    H -->|아니요| J{모든 평균이 40% 미만인가?}
+    J -->|예| K[한 단계 Scale Down 목표 계산]
+    J -->|아니요| Z
+    I --> L{실제 SKU 변경이 필요한가?}
+    K --> L
+    L -->|아니요| Z
+    L -->|예| M[ARM PATCH 요청]
+    M --> N[Teams 알림 및 결과 로그]
+    N --> Z
 ```
 
-### Example
+## 6. Autoscale 관리 대상 SKU
 
-```text
-baseCapacityUnits = 32
-capacityUnitMs    = 465,000
-Window            = 30 seconds
-
-Capacity Budget = 32 × 30,000
-                = 960,000 CUms
-
-Utilization = 465,000 / 960,000 × 100
-            = 48.44%
-```
-
-Pattern 3는 이 Event 단위 Utilization을 이용하여 10분 Rolling Average를 계산합니다.
-
----
-
-## 7. SKU Ladder and Scaling Policies
-
-Fabric Capacity SKU는 다음과 같은 순서로 구성할 수 있습니다.
+코드에는 다음 SKU 단계가 정의되어 있습니다.
 
 ```text
 F2 → F4 → F8 → F16 → F32 → F64
 ```
 
-Autoscaling 시에는 환경별로 허용된 최소 및 최대 SKU 범위를 적용하는 것이 권장됩니다.
+Dynamic Autoscale 운영 범위는 환경별로 제한됩니다.
 
-### Example SKU Policies
+| 환경 | 최소 SKU | 최대 SKU | 일반적인 Scale Up / Down |
+|---|---|---|---|
+| STG | F8 | F16 | F8 ↔ F16 |
+| PRD | F16 | F32 | F16 ↔ F32 |
 
-| Pattern | Environment | SKU Range |
+현재 SKU가 운영 범위보다 **낮은 경우**, 고사용률 조건이 충족될 때만 한 단계 Scale Up합니다.
+
+현재 SKU가 운영 범위보다 **높은 경우**, 저사용률 조건이 충족될 때만 한 단계 Scale Down합니다.
+
+그 외에는 현재 SKU를 유지하며, 지원하지 않는 SKU는 변경하지 않습니다.
+
+## 7. 최근 사용률 데이터 수집
+
+Fabric Capacity Summary 이벤트의 `capacityUnitMs`와 `baseCapacityUnits` 필드를 사용하여 30초 이벤트별 사용률을 계산합니다.
+
+```text
+사용률(%) = capacityUnitMs / (baseCapacityUnits × 1000 × EventWindowSeconds) × 100
+```
+
+현재 설정은 `EventWindowSeconds = 30`입니다.
+
+14분 데이터를 수집하는 이유는 **14분 평균을 계산하기 위해서가 아니라**, 1분 간격의 10분 평균 5개를 계산하는 데 필요한 최소 시간 범위를 확보하기 위해서입니다.
+
+```text
+조회 범위 = Window Size + ((Required Steps - 1) × Step Size)
+
+          = 10분 + ((5 - 1) × 1분)
+
+          = 14분
+```
+
+## 8. Rolling Average 분석
+
+계산 기준 시각이 15:00이라고 가정하면 다음과 같이 평가합니다.
+
+| Step | 10분 평균 구간(KST) | 평가 시각 |
 |---|---|---|
-| Pattern 1 / 2 | DEV | F2–F8 (예시) |
-| Pattern 1 / 2 | STG | F4–F64 (예시) |
-| Pattern 1 / 2 | PRD | F16–F64 (예시) |
-| Pattern 3 | STG | F8–F16 |
-| Pattern 3 | PRD | F16–F32 |
-
-Pattern 1과 Pattern 2의 범위는 참고 예시이며, Pattern 3는 해당 Dynamic Autoscale 구현에 설정된 정책을 나타냅니다.
-
-실제 운영 환경에서는 Workload 특성, 비용 및 운영 정책에 맞춰 SKU 범위를 설정해야 합니다.
-
----
-
-## 8. Authentication
-
-Source Code에 Credential을 직접 저장하지 않고 Microsoft Entra ID 기반 인증을 사용하는 것을 권장합니다.
-
-### Local Development
-
-```text
-DefaultAzureCredential
-        ↓
-Azure CLI / Developer Credential
-```
-
-### AKS Workload Identity
+| 1 | 14:46–14:56 | 14:56 |
+| 2 | 14:47–14:57 | 14:57 |
+| 3 | 14:48–14:58 | 14:58 |
+| 4 | 14:49–14:59 | 14:59 |
+| 5 | 14:50–15:00 | 15:00 |
 
 ```mermaid
-flowchart TD
-    A["Kubernetes ServiceAccount"]
-    B["AKS Workload Identity"]
-    C["Microsoft Entra ID"]
-    D["Azure Event Hubs / Azure ARM"]
-
-    A --> B --> C --> D
+flowchart TB
+    A["최근 14분: 14:46–15:00"] --> B["Step 1: 14:46–14:56"]
+    A --> C["Step 2: 14:47–14:57"]
+    A --> D["Step 3: 14:48–14:58"]
+    A --> E["Step 4: 14:49–14:59"]
+    A --> F["Step 5: 14:50–15:00"]
+    B --> G{5개 평균 조건 확인}
+    C --> G
+    D --> G
+    E --> G
+    F --> G
 ```
 
-실제 인증 방식은 패턴 및 실행 환경에 따라 달라질 수 있습니다.
+각 Step은 해당 10분 구간에 포함된 이벤트 사용률의 산술평균입니다.
 
-다음 정보는 Repository에 Commit하지 않습니다.
+**1분 Step은 단일 CronJob 실행 내부의 계산 간격이며, CronJob 자체의 실행 주기가 아닙니다.**
 
-```text
-Client Secret
-Access Token
-SAS Key
-Event Hub Connection String
-Webhook URL
-Production Credentials
-```
+> 이 구현에서 첫 번째 평가 시각과 마지막 평가 시각의 차이는 4분입니다. 이를 5회의 연속 평가로 처리하지만, Microsoft Fabric Activator 내부의 시간 처리 방식과 완전히 동일하다고 보장하지는 않습니다.
 
----
+## 9. Scale Up 조건
 
-## 9. Network Requirements
+**10분 평균 사용률 5개가 모두 80%를 초과하면** Scale Up을 선택합니다.
 
-Pattern 2와 Pattern 3는 AKS에서 Event Hubs-compatible Endpoint로의 Outbound 통신이 필요합니다.
+| Step | 평균 사용률 | 조건 |
+|---|---:|---|
+| 1 | 82% | 충족 |
+| 2 | 84% | 충족 |
+| 3 | 85% | 충족 |
+| 4 | 87% | 충족 |
+| 5 | 86% | 충족 |
 
-```text
-Direction   : Outbound
-Destination : *.servicebus.windows.net
-Protocol    : AMQP over WebSocket / TLS
-Port        : TCP 443
-```
+**판단 결과: `SCALE_UP`**
 
-Python SDK에서는 다음 Transport를 사용합니다.
+현재 SKU와 정책에 따라 STG F8 → F16 또는 PRD F16 → F32 변경을 요청합니다.
 
-```python
-TransportType.AmqpOverWebsocket
-```
+## 10. Scale Down 조건
 
-이를 통해 기본 AMQP TCP 5671 대신 TCP 443을 사용할 수 있습니다.
+**10분 평균 사용률 5개가 모두 40% 미만이면** Scale Down을 선택합니다.
 
-또한 Capacity 상태 조회 및 SKU 변경을 위해 Azure Resource Manager Endpoint에 접근할 수 있어야 합니다.
+| Step | 평균 사용률 | 조건 |
+|---|---:|---|
+| 1 | 36% | 충족 |
+| 2 | 34% | 충족 |
+| 3 | 31% | 충족 |
+| 4 | 29% | 충족 |
+| 5 | 27% | 충족 |
 
-Pattern 1에서는 AKS Event Consumer가 필요하지 않으므로 해당 AKS Outbound 구성이 필요하지 않습니다.
+**판단 결과: `SCALE_DOWN`**
 
----
+현재 SKU와 정책에 따라 STG F16 → F8 또는 PRD F32 → F16 변경을 요청합니다.
 
-## 10. Repository Structure
+## 11. Capacity를 변경하지 않는 경우
 
-```text
-fabric-capacity-autoscaling-patterns/
-├── Fabric Eventhub Dynamic Autoscale/
-│   ├── cronjob/
-│   ├── src/
-│   ├── README.ko.md
-│   ├── README.md
-│   └── requirements.txt
-├── Fabric Eventstream Activator Notebook/
-├── Fabric Eventstream Custom Endpoint/
-├── README.ko.md
-└── README.md
-```
+다음 예시에서는 Step 3의 평균 사용률이 80%를 초과하지 않으므로 연속 Scale Up 조건을 충족하지 못합니다.
 
-위 구조는 현재 Repository 디렉터리를 기준으로 작성했습니다.
+| Step | 평균 사용률 |
+|---|---:|
+| 1 | 82% |
+| 2 | 84% |
+| 3 | 77% |
+| 4 | 85% |
+| 5 | 88% |
 
----
+**판단 결과: `MAINTAIN` — 현재 SKU 유지**
 
-## 11. Which Pattern Should You Choose?
+다음 경우에도 SKU를 변경하지 않습니다.
 
-### Pattern 1 — Eventstream + Activator + Notebook
+- Capacity 상태가 `Active`가 아닌 경우
+- 지원하지 않는 SKU인 경우
+- Rolling Evaluation이 5개 미만인 경우
+- 10분 Window의 이벤트 수가 예상치보다 부족한 경우(30초 간격 기준 20건)
+- Scale Up / Down 조건을 충족하지 않거나 설정된 최대·최소 SKU에 이미 도달한 경우
 
-다음 상황에 적합합니다.
+이벤트 수 검증은 **기본적인 데이터 완전성 확인 방법**입니다. 이벤트가 20건 이상 수집되더라도 모든 예상 시간 구간에 균등하게 분포되어 있다고 보장할 수는 없습니다.
 
-- Fabric Native Architecture를 우선하는 경우
-- Autoscaling Logic을 Fabric 내부에서 관리하려는 경우
-- Activator의 Window / Step / Time Elapsed 기능을 활용하려는 경우
-- 별도 Kubernetes Consumer를 운영하지 않으려는 경우
-- Notebook Session 초기화 시간이 허용 가능한 경우
+## 12. 실제 Capacity SKU 변경
 
-### Pattern 2 — Eventstream Custom Endpoint + AKS CronJob
-
-다음 상황에 적합합니다.
-
-- 기존 AKS Batch 운영체계를 활용하려는 경우
-- Autoscaling Control Plane을 Fabric 외부에서 관리하려는 경우
-- Notebook Session 초기화 시간을 제거하려는 경우
-- Kubernetes 기반 배포/로그/스케줄 관리체계를 재사용하려는 경우
-- Python 기반 Autoscaling Policy를 직접 구현하려는 경우
-
-### Pattern 3 — Event Hubs + AKS Dynamic Autoscale
-
-다음 상황에 적합합니다.
-
-- Fabric Capacity 사용률 기반 자동 SKU 변경이 필요한 경우
-- 평일 업무시간에만 Dynamic Scaling을 적용하려는 경우
-- 일시적인 사용률 변동보다 지속적인 사용률 추세를 반영하려는 경우
-- 환경별 SKU 최소/최대 범위를 엄격하게 적용하려는 경우
-- Schedule 기반 운영과 Dynamic Scaling을 병행하려는 경우
-- Teams를 통해 Scaling 요청 결과를 확인하려는 경우
-
----
-
-## 12. POC and Validation Scope
-
-### Pattern 1 — Activator + Notebook
-
-```text
-Capacity Summary Event 수집
-Eventstream Utilization 계산
-Activator Rule 평가
-Window / Step / Time Elapsed 구성
-Activator Parameter 전달
-Scale Up Notebook
-Scale Down Notebook
-Azure ARM Capacity SKU 변경
-```
-
-### Pattern 2 — Custom Endpoint + AKS
-
-```text
-Fabric Eventstream Custom Endpoint
-Event Hubs-compatible Connection
-Microsoft Entra ID 인증
-AKS Workload Identity
-AMQP over WebSocket / TCP 443
-Capacity Summary Event 수신
-Utilization 계산
-One-Shot CronJob 실행
-Azure ARM Capacity 연계
-```
-
-### Pattern 3 — Dynamic Autoscale
-
-```text
-Capacity Summary Event 수신
-최근 14분 데이터 수집
-10분 Rolling Average 계산
-1분 Step × 5회 평가
-80% / 40% 연속 조건 판단
-운영 시간 및 주말 정책 검증
-STG / PRD SKU 범위 검증
-Azure ARM SKU 변경 요청
-Microsoft Teams 알림
-Read-only Utilization POC 검증
-```
-
-Pattern 3에는 실제 SKU를 변경하지 않고 Event Hub 사용률 계산과 Rolling Average 결과를 확인할 수 있는 별도 POC 코드가 포함됩니다.
-
----
-
-## 13. Security Considerations
-
-본 Repository는 Architecture Pattern 및 Sample 구현을 목적으로 합니다.
-
-Public Repository에는 다음 정보를 포함하지 않습니다.
-
-```text
-Subscription ID
-Tenant ID
-Actual Client ID
-Client Secret
-Capacity Resource ID
-Production Eventstream Endpoint
-Production Consumer Group
-Webhook URL
-Connection String
-Private IP
-```
-
-환경별 설정값은 다음과 같은 방법으로 관리하는 것을 권장합니다.
-
-```text
-Environment Variables
-Kubernetes Secret
-Azure Key Vault
-Secret Management System
-```
-
-실제 운영 로그에는 Capacity 이름, 리소스 식별자 또는 사용량 정보가 포함될 수 있으므로 공개 전 검토가 필요합니다.
-
----
-
-## 14. Operational Considerations
-
-Production 환경에서 Autoscaling을 적용하기 전 다음 사항을 확인해야 합니다.
-
-- Fabric Capacity Workload 및 사용량 패턴
-- SKU 변경에 따른 비용 영향
-- Scale Up / Scale Down 빈도
-- Event Hub 데이터 수집 지연
-- Rolling Average 계산의 데이터 완전성
-- CronJob 중복 실행 및 Schedule 작업과의 충돌
-- Azure ARM API 요청 결과
-- SKU 변경 완료 여부
-- Capacity 전환 중 서비스 영향
-- 장애 및 알림 처리
-
-**ARM PATCH 요청이 수락되었다고 해서 실제 SKU 변경이 완료된 것은 아닙니다.**
-
-최종 SKU 및 Provisioning State는 Azure Resource Manager를 통해 별도로 확인하는 것이 권장됩니다.
-
----
-
-## 15. Disclaimer
-
-본 Repository의 Autoscaling Threshold, SKU 범위, Rule Duration 및 Schedule은 POC 또는 Reference 구현의 설정값입니다.
-
-Production 적용 시 실제 환경의 요구사항에 맞춰 검증해야 합니다.
-
-특히 Pattern 3의 Rolling Average는 Activator의 Window / Step / Time Elapsed 개념을 참고한 Python 기반 구현이며, Fabric Activator 내부 동작과 완전히 동일하다고 보장하지 않습니다.
-
-자동 SKU 변경을 활성화하기 전에 DEV / STG 환경에서 충분한 검증을 수행하는 것을 권장합니다.
-
----
-
-## 16. Summary
-
-세 가지 Autoscaling Pattern은 동일한 Fabric Capacity Summary Event를 기반으로 하지만, Autoscaling Control Plane 및 실행 방식에 차이가 있습니다.
+Scale Up 또는 Scale Down이 필요한 경우 현재 SKU를 기준으로 목표 SKU를 계산하고 ARM API에 PATCH 요청을 전송합니다.
 
 ```mermaid
-flowchart LR
-    A["Pattern 1<br/>Fabric Native"] --> D["Fabric Capacity<br/>SKU Management"]
-    B["Pattern 2<br/>AKS External Control"] --> D
-    C["Pattern 3<br/>AKS Dynamic Autoscale"] --> D
+sequenceDiagram
+    participant J as AKS CronJob
+    participant E as Azure Event Hubs
+    participant A as Azure Resource Manager
+    participant F as Fabric Capacity
+    participant T as Microsoft Teams
+    J->>A: Capacity 상태 및 SKU GET
+    A-->>J: Active / F16
+    J->>E: Capacity Summary 이벤트 조회
+    E-->>J: 최근 14분 이벤트
+    Note over J: 5개 Rolling Average 모두 80% 초과
+    J->>A: 목표 SKU F32 PATCH
+    A-->>J: HTTP 200/201/202
+    A->>F: SKU 변경 처리
+    J->>T: 변경 요청 결과 알림
 ```
 
-- **Pattern 1:** Fabric-native Event-driven Autoscaling
-- **Pattern 2:** Event-driven Metrics + Kubernetes Scheduled Control
-- **Pattern 3:** Event-driven Metrics + Rolling Average + Policy-based Dynamic Scaling
+**주의:** ARM API의 `200`, `201`, `202` 응답은 요청 성공 또는 접수를 의미합니다. 특히 `202 Accepted`는 실제 SKU 변경 완료를 보장하지 않습니다.
 
-운영 환경에서는 조직의 Platform Architecture, Network Policy, 실행 지연 요구사항, 운영 정책 및 비용 최적화 목표에 따라 적합한 패턴을 선택할 수 있습니다.
+변경 완료 여부는 Capacity 상태와 SKU를 다시 조회하여 별도로 검증해야 합니다.
+
+## 13. Autoscale 실행 주기
+
+Dynamic Autoscale CronJob은 **15분 간격**으로 실행하도록 설정되어 있습니다.
+
+```text
+14:45          15:00          15:15          15:30
+  |              |              |              |
+  v              v              v              v
+Autoscale      Autoscale      Autoscale      Autoscale
+평가           평가           평가           평가
+```
+
+Fabric 사용률 이벤트는 CronJob 실행과 관계없이 Event Hubs로 계속 전달됩니다.
+
+실제 CronJob 실행 일정은 Kubernetes Helm values 또는 CronJob 매니페스트의 `spec.schedule`을 통해 관리합니다.
+
+**예시 파일: `cronjob.yaml`**
+
+```yaml
+schedule: "*/15 * * * 1-5"
+```
+
+> 위 설정은 평일 15분 간격 실행 예시입니다. 애플리케이션 내부의 08:15~17:45 운영시간 검사와 함께 사용해야 합니다. CronJob의 시간대는 `spec.timeZone: "Asia/Seoul"`처럼 명시적으로 설정하고, Kubernetes 스케줄러 설정 및 `concurrencyPolicy`도 확인해야 합니다.
+
+## 14. Microsoft Teams 알림
+
+실제 SKU 변경이 요청되면 애플리케이션이 Teams 알림을 전송합니다. 변경 요청 실패 시에도 알림 전송을 시도합니다.
+
+`TEAMS_WEBHOOK_URL`이 설정되지 않은 경우 알림은 생략됩니다.
+
+```text
+Fabric Capacity Dynamic Autoscale Notification
+
+Environment : PRD
+Capacity    : example-fabric-capacity
+Event       : Dynamic-Autoscale
+Message     : SCALE_UP: F16 -> F32 | 10-min AVG=85.42% | 5 consecutive evaluations met
+```
+
+이 알림은 SKU 변경 **요청 결과**를 전달하는 것으로, 실제 SKU 변경 완료 검증을 대신하지 않습니다.
+
+## 15. 배포 환경변수
+
+| 환경변수 | 용도 | 공개용 예시 |
+|---|---|---|
+| `ENV` | 환경별 SKU 정책 선택 | `stg` 또는 `prd` |
+| `subscriptionId` | Azure Subscription ID | `<subscription-id>` |
+| `resourceGroup` | Fabric Capacity 리소스 그룹 | `<resource-group>` |
+| `capacityName` | Fabric Capacity 이름 | `example-fabric-capacity` |
+| `Fabric-Event-Hub-namespace-endpoint` | Event Hubs FQDN | `example.servicebus.windows.net` |
+| `Fabric-Event-Hub-name` | Event Hub 이름 | `fabric-capacity-events` |
+| `Fabric-Event-Hub-Consumer-group` | Consumer Group | `$Default` |
+| `TEAMS_WEBHOOK_URL` | Teams 알림 URL(선택) | Secret으로 주입 |
+
+필요한 Python 패키지는 `azure-eventhub`, `azure-identity`, `requests`입니다.
+
+AKS ServiceAccount에 Workload Identity를 구성하고, Event Hubs 데이터 수신 권한과 Fabric Capacity 변경 권한을 각각 부여해야 합니다.
+
+## 16. 운영 검증
+
+배포 후 다음 항목을 확인합니다.
+
+1. **CronJob:** `kubectl get cronjob -n <namespace>`로 실행 일정 및 배포 상태를 확인합니다.
+2. **Job 실행:** `kubectl get jobs -n <namespace>`로 최근 실행 내역과 성공 여부를 확인합니다.
+3. **실행 로그:** `kubectl logs -n <namespace> job/<job-name>`으로 Rolling Average, Action, 목표 SKU를 확인합니다.
+4. **ARM:** Azure Portal의 Fabric Capacity 리소스에서 현재 상태와 SKU를 확인합니다.
+5. **Teams:** SKU 변경 요청 발생 시 알림 수신 여부를 확인합니다.
+6. **안전 조건:** 운영시간 외, 주말, 데이터 부족, Capacity 비활성 상태에서 SKU가 변경되지 않는지 확인합니다.
+
+## 17. 요약
+
+| 항목 | 정책 |
+|---|---|
+| 평일 운영 | 월~금 08:15 이상 ~ 17:45 미만(KST) |
+| 주말 운영 | Dynamic Autoscale 비활성화 |
+| CronJob 실행 주기 | 15분 간격 |
+| 이벤트 조회 범위 | 최근 14분 |
+| 사용률 계산 | 30초 Capacity Summary 이벤트 |
+| Rolling Average | 10분 Window, 1분 Step, 5회 평가 |
+| Scale Up | 5개 평균 모두 80% 초과 |
+| Scale Down | 5개 평균 모두 40% 미만 |
+| 조건 미충족 | 현재 SKU 유지 |
+| 데이터 부족 또는 유효하지 않음 | SKU 변경하지 않음 |
+| STG SKU | F8 ↔ F16 |
+| PRD SKU | F16 ↔ F32 |
+| 변경 단위 | 인접 SKU 한 단계 |
+| 변경 API | Azure Resource Manager |
+| 알림 | Microsoft Teams |
+| 변경 대응 시점 | 다음 CronJob 평가 시점(최대 15분의 스케줄 대기 + 수집·처리 지연) |
 
 ---
 
-## Maintainer
-
-김민서  
-MegazoneCloud
+**참고:** 본 문서는 예시 정책을 포함한 Reference Architecture입니다. 실제 운영환경에 적용하기 전에 Fabric Capacity SKU, 이벤트 수집 지연, Azure API 권한, 중복 실행 방지, Schedule 기반 제어 작업과의 충돌 여부를 검증해야 합니다.
